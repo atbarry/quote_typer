@@ -13,7 +13,7 @@ serde = { version = "1.0.189", features = ["derive"] }
 tokio = { version = "1.33.0", features = ["full"] }
 
 [profile.release]
-# strip = true  # Automatically strip symbols from the binary.
-# opt-level = "z"  # Optimize for size.
-# lto = true
-# codegen-units = 1
+strip = true  # Automatically strip symbols from the binary.
+opt-level = "z"  # Optimize for size.
+lto = true
+codegen-units = 1

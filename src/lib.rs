@@ -1,12 +1,13 @@
 pub mod quote;
+mod typing;
 
 use crossterm::{
     cursor,
-    event::{read, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{read, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind},
     execute, queue, style, terminal,
 };
 use quote::Quote;
-use std::io::{Stdout, Write};
+use std::{io::{Stdout, Write}, fs::File};
 
 /// This is where the actual typing test is done
 pub fn typing_session(stdout: &mut Stdout, quote: &Quote) -> std::io::Result<Vec<char>> {
@@ -14,10 +15,15 @@ pub fn typing_session(stdout: &mut Stdout, quote: &Quote) -> std::io::Result<Vec
     let quote_chars = quote.content_chars();
     let mut typed_chars: Vec<char> = vec![];
     let (mut cols, mut _rows) = terminal::size()?;
+    let mut file = File::create("log.txt")?;
 
     while typed_chars.len() < quote_chars.len() {
         // `read()` blocks until an `Event` is available
-        let key = match read()? {
+        let event = read()?;
+        let buf = format!("{:?}\n", event);
+        file.write_all(buf.as_bytes())?;
+
+        let key = match event {
             Event::Key(key) => key,
             Event::Resize(c, r) => {
                 cols = c;
@@ -27,6 +33,11 @@ pub fn typing_session(stdout: &mut Stdout, quote: &Quote) -> std::io::Result<Vec
             },
             _ => continue,
         };
+
+        // We don't care about the release
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
 
         match key {
             // Exit on ctr-c
@@ -51,7 +62,7 @@ pub fn typing_session(stdout: &mut Stdout, quote: &Quote) -> std::io::Result<Vec
                 let (cursor_col, cursor_row) = cursor::position()?;
                 // if the cursor is on the first or 0th column then
                 // the cursor needs to be moved up one row and all
-                // the way to the right
+                // the way to the right.
                 if cursor_col == 0 && cursor_row != 0 {
                     execute!(
                         stdout,
