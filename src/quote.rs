@@ -26,4 +26,3 @@ pub async fn get_quote() -> Result<Quote, reqwest::Error> {
         .json::<Quote>()
         .await
 }
-

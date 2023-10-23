@@ -1,142 +1,206 @@
 pub mod quote;
-mod typing;
+pub mod typing;
 
-use crossterm::{
-    cursor,
-    event::{read, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind},
-    execute, queue, style, terminal,
-};
+use crossterm::{cursor, execute, queue, style, terminal};
+use log::{log, debug};
 use quote::Quote;
-use std::{io::{Stdout, Write}, fs::File};
+use std::{
+    io::{self, Stdout, Write},
+    iter::zip,
+};
 
-/// This is where the actual typing test is done
-pub fn typing_session(stdout: &mut Stdout, quote: &Quote) -> std::io::Result<Vec<char>> {
-    initialize_session(stdout, &quote.content)?;
-    let quote_chars = quote.content_chars();
-    let mut typed_chars: Vec<char> = vec![];
-    let (mut cols, mut _rows) = terminal::size()?;
-    let mut file = File::create("log.txt")?;
-
-    while typed_chars.len() < quote_chars.len() {
-        // `read()` blocks until an `Event` is available
-        let event = read()?;
-        let buf = format!("{:?}\n", event);
-        file.write_all(buf.as_bytes())?;
-
-        let key = match event {
-            Event::Key(key) => key,
-            Event::Resize(c, r) => {
-                cols = c;
-                _rows = r;
-                reset_session(stdout, &quote_chars, &typed_chars)?;
-                continue
-            },
-            _ => continue,
-        };
-
-        // We don't care about the release
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-
-        match key {
-            // Exit on ctr-c
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => break,
-            // Print characters typed
-            KeyEvent { code: KeyCode::Char(c), .. } => {
-                typed_chars.push(c);
-                print_char(stdout, &quote_chars, &typed_chars)?;
-            }
-            // Go to new line on enter
-            KeyEvent { code: KeyCode::Enter, .. } => {
-                typed_chars.push('\n');
-                print_char(stdout, &quote_chars, &typed_chars)?;
-            }
-            // On backspace do some stuff
-            KeyEvent { code: KeyCode::Backspace, .. } => {
-                typed_chars.pop();
-                let (cursor_col, cursor_row) = cursor::position()?;
-                // if the cursor is on the first or 0th column then
-                // the cursor needs to be moved up one row and all
-                // the way to the right.
-                if cursor_col == 0 && cursor_row != 0 {
-                    execute!(
-                        stdout,
-                        cursor::MoveToPreviousLine(1),
-                        cursor::MoveToColumn(cols - 1),
-                        style::Print("")
-                    )?;
-                } else {
-                    execute!(stdout, cursor::MoveLeft(1), style::Print(""))?;
-                }
-            }
-            _ => (),
-        }
-    }
-
-    terminate_session(stdout)?;
-    Ok(typed_chars)
+struct ColoredChar {
+    character: char,
+    color: style::Color,
 }
 
+impl ColoredChar {
+    fn new(typed_char: &char, quote_char: &char) -> Self {
+        let color = if typed_char == quote_char {
+            style::Color::Green
+        } else {
+            style::Color::Red
+        };
 
-fn initialize_session(stdout: &mut Stdout, quote_str: &str) -> Result<(), std::io::Error> {
-    execute!(stdout,
+        Self {
+            character: *quote_char,
+            color,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Cursor {
+    col: u16,
+    row: u16,
+    num_cols: u16,
+    num_rows: u16,
+}
+
+impl Cursor {
+    fn new() -> io::Result<Self> {
+        let (col, row) = cursor::position()?;
+        let (num_cols, num_rows) = terminal::size()?;
+        Ok(Self {
+            col,
+            row,
+            num_cols,
+            num_rows,
+        })
+    }
+
+    fn align_center(&mut self, out: &mut Stdout, num_chars: u32) -> io::Result<()> {
+        debug!("{:?}, {:?}", num_chars, self.num_cols);
+        let cursor_col = num_chars as u16 % self.num_cols;
+        let mut cursor_row = num_chars as u16 / self.num_cols;
+
+        if cursor_row > self.num_rows / 2 {
+            cursor_row = self.num_rows / 2;
+        }
+
+        self.col = cursor_col;
+        self.row = cursor_row;
+        execute!(out, cursor::MoveTo(cursor_col, cursor_row))
+    }
+
+    fn write_before(&self, out: &mut Stdout, chars: &[ColoredChar]) -> io::Result<()> {
+        let mut cursor = self.clone();
+
+        for c in chars {
+            if cursor.cursor_back_one(&c.character).is_err() {
+                break;
+            };
+
+            queue!(
+                out,
+                cursor::MoveTo(cursor.col, cursor.row),
+                style::SetForegroundColor(c.color),
+                style::Print(c.character)
+            )?;
+        }
+        queue!(out, cursor::MoveTo(self.col, self.row))?;
+        out.flush()
+    }
+
+    fn write_after(&self, out: &mut Stdout, chars: &[char]) -> io::Result<()> {
+        let mut cursor = self.clone();
+        queue!(out, style::SetForegroundColor(style::Color::Reset))?;
+
+        for c in chars {
+            if cursor.cursor_forward_one(c).is_err() {
+                break;
+            };
+
+            queue!(out, style::Print(c))?;
+        }
+        queue!(out, cursor::MoveTo(self.col, self.row))?;
+        out.flush()
+    }
+
+    fn cursor_back_one(&mut self, c: &char) -> Result<(), ()> {
+        if c == &'\n' {
+            if self.row == 0 {
+                return Err(());
+            } else {
+                self.row -= 1;
+                return Ok(());
+            }
+        }
+        if self.col == 0 && self.row == 0 {
+            // cannot move back one if at 0, 0
+            return Err(());
+        } else if self.col == 0 {
+            self.row -= 1;
+        } else {
+            self.col -= 1;
+        }
+        Ok(())
+    }
+
+    fn cursor_forward_one(&mut self, c: &char) -> Result<(), ()> {
+        if c == &'\n' {
+            if self.row == self.num_rows - 1 {
+                return Err(());
+            } else {
+                self.row += 1;
+                return Ok(());
+            }
+        }
+        if self.col == self.num_cols - 1 && self.row == self.num_rows - 1 {
+            // cannot move back one if at 0, 0
+            return Err(());
+        } else if self.col == self.num_cols - 1 {
+            self.row += 1;
+        } else {
+            self.col += 1;
+        }
+        Ok(())
+    }
+}
+
+pub fn initialize_session(out: &mut Stdout) -> Result<(), std::io::Error> {
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
         terminal::Clear(terminal::ClearType::All),
         cursor::MoveTo(0, 0),
-        style::Print(quote_str.to_owned()),
-        cursor::MoveTo(0, 0)
     )?;
     terminal::enable_raw_mode()
 }
 
-fn reset_session(stdout: &mut Stdout, quote: &[char], chars_typed: &[char]) -> std::io::Result<()> {
-    queue!(stdout, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
-    for (index, quote_char) in quote.iter().enumerate() {
-        if let Some(char) = chars_typed.get(index) {
-            let color = if char == quote_char {
-                style::Color::Green
-            } else {
-                style::Color::Red
-            };
-            queue!(stdout, style::SetForegroundColor(color))?;
-        } else {
-            queue!(stdout, style::ResetColor)?;
-        };
-        queue!(stdout, style::Print(quote_char))?;
-    }
-
-    let (cols, _rows) = terminal::size()?;
-    let cursor_col = chars_typed.len() as u16 % cols;
-    let cursor_row = chars_typed.len() as u16 / cols;
-    queue!(stdout, cursor::MoveTo(cursor_col, cursor_row))?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn terminate_session(stdout: &mut Stdout) -> std::io::Result<()> {
+pub fn terminate_session(out: &mut Stdout) -> std::io::Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(stdout, style::ResetColor)?;
+    execute!(out, style::ResetColor, terminal::LeaveAlternateScreen)?;
     println!("\n");
     Ok(())
 }
 
-fn print_char(
-    stdout: &mut Stdout,
-    quote: &[char],
-    chars_typed: &[char],
+fn reset_session(
+    out: &mut Stdout,
+    quote_chars: &[char],
+    typed_chars: &[char],
 ) -> std::io::Result<()> {
-    let len = chars_typed.len();
-    let c = quote[len - 1];
-    let color = if &c == chars_typed.last().unwrap() {
-        style::Color::Green
-    } else {
-        style::Color::Red
-    };
+    let mut cursor = Cursor::new()?;
+    cursor.align_center(out, typed_chars.len() as u32)?;
+    let before_cursor: Vec<ColoredChar> = zip(typed_chars.iter(), quote_chars.iter())
+        .map(|(t, q)| ColoredChar::new(t, q))
+        .rev()
+        .collect();
 
-    execute!(stdout, style::SetForegroundColor(color), style::Print(c))
+    let after_cursor = &quote_chars[typed_chars.len()..];
+    cursor.write_before(out, &before_cursor)?;
+    cursor.write_after(out, after_cursor)?;
+    Ok(())
 }
 
+// fn print_char(stdout: &mut Stdout, quote: &[char], chars_typed: &[char]) -> std::io::Result<()> {
+//     let len = chars_typed.len();
+//     let c = quote[len - 1];
+//     let color = if &c == chars_typed.last().unwrap() {
+//         style::Color::Green
+//     } else {
+//         style::Color::Red
+//     };
+//
+//     execute!(stdout, style::SetForegroundColor(color), style::Print(c))
+// }
+
+fn on_backspace(out: &mut Stdout) -> io::Result<()> {
+    let (cursor_col, cursor_row) = cursor::position()?;
+    let (terminal_cols, termial_rows) = terminal::size()?;
+    // if the cursor is on the first or 0th column then
+    // the cursor needs to be moved up one row and all
+    // the way to the right.
+    if cursor_col == 0 && cursor_row != 0 {
+        execute!(
+            out,
+            cursor::MoveToPreviousLine(1),
+            cursor::MoveToColumn(terminal_cols - 1),
+            style::Print("")
+        )?;
+    } else {
+        execute!(out, cursor::MoveLeft(1), style::Print(""))?;
+    }
+
+    Ok(())
+}
